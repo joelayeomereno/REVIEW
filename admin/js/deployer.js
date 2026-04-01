@@ -17,8 +17,7 @@ const JSZIP_URL   = CFG.jsZipUrl  || '';
 
 /* ── Engine constants ────────────────────────────────────── */
 const BATCH_SIZE        = 80;          // files per batch request
-const CHUNK_SIZE        = 2 * 1024 * 1024; // 2 MB per chunk for large files
-const LARGE_FILE        = 8 * 1024 * 1024; // > 8 MB → chunked
+const LARGE_FILE        = 8 * 1024 * 1024; // > 8 MB → sent as solo batch (one file per request)
 const MAX_WORKERS       = 16;          // parallel XHR per job
 const CHUNK_RETRIES     = 3;           // per-request retry limit
 const VIRTUAL_PAGE      = 200;         // max rows rendered in tree at once
@@ -301,16 +300,21 @@ class DeployJob {
 
     /* Step 4: Batch mode (or fallback from ZIP) */
     if (this.mode === 'batch') {
-      const concurrency  = this._concurrency(toUpload);
-      const totalBatches = Math.ceil(toUpload.length / BATCH_SIZE);
-      this.log_line('info', this.slug, `⚡ BATCH × ${concurrency} workers — ${totalBatches} batches`);
+      /* Large files (>LARGE_FILE) get their own solo request to avoid post_max_size failures */
+      const largeFiles  = toUpload.filter(f => f.size > LARGE_FILE);
+      const normalFiles = toUpload.filter(f => f.size <= LARGE_FILE);
+      const batches = [];
+      for (let i = 0; i < normalFiles.length; i += BATCH_SIZE) batches.push(normalFiles.slice(i, i + BATCH_SIZE));
+      for (const f of largeFiles) batches.push([f]);
+
+      const concurrency = this._concurrency(toUpload);
+      this.log_line('info', this.slug, `⚡ BATCH × ${concurrency} workers — ${batches.length} batches${largeFiles.length ? ` (${largeFiles.length} large file${largeFiles.length !== 1 ? 's' : ''} solo)` : ''}`);
 
       let batchIdx = 0;
       const run_batch = async () => {
-        while (!this.aborted && batchIdx * BATCH_SIZE < toUpload.length) {
+        while (!this.aborted && batchIdx < batches.length) {
           const bi    = batchIdx++;
-          const start = bi * BATCH_SIZE;
-          const batch = toUpload.slice(start, start + BATCH_SIZE);
+          const batch = batches[bi];
           try {
             const fd = new FormData();
             fd.append('plugin_slug', this.slug);
@@ -859,6 +863,10 @@ function show_slug_prompt(files) {
     close();
   });
   backdrop.addEventListener('click', e => { if (e.target===backdrop) close(); });
+  backdrop.querySelector('#slug-prompt-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter')  backdrop.querySelector('#slug-prompt-ok').click();
+    if (e.key === 'Escape') close();
+  });
 }
 
 /* A2: Rename modal — lets the user set the server target slug independently of the local folder name */
