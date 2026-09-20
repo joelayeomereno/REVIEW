@@ -5,22 +5,7 @@ class WPFD_REST_API {
 
     const NAMESPACE = 'wpfd/v1';
 
-    /** Temporary session store for backup path during a deploy session */
-    const TRANSIENT_PREFIX = 'wpfd_session_';
-
     public function register_routes(): void {
-        register_rest_route( self::NAMESPACE, '/upload-file', [
-            'methods'             => 'POST',
-            'callback'            => [ $this, 'upload_file' ],
-            'permission_callback' => [ $this, 'check_permission' ],
-        ] );
-
-        register_rest_route( self::NAMESPACE, '/finalise', [
-            'methods'             => 'POST',
-            'callback'            => [ $this, 'finalise_deploy' ],
-            'permission_callback' => [ $this, 'check_permission' ],
-        ] );
-
         register_rest_route( self::NAMESPACE, '/rollback', [
             'methods'             => 'POST',
             'callback'            => [ $this, 'rollback' ],
@@ -63,34 +48,16 @@ class WPFD_REST_API {
             'permission_callback' => [ $this, 'check_permission' ],
         ] );
 
-        register_rest_route( self::NAMESPACE, '/upload-batch', [
-            'methods'             => 'POST',
-            'callback'            => [ $this, 'upload_batch' ],
-            'permission_callback' => [ $this, 'check_permission' ],
-        ] );
-
-        register_rest_route( self::NAMESPACE, '/upload-zip', [
-            'methods'             => 'POST',
-            'callback'            => [ $this, 'upload_zip' ],
-            'permission_callback' => [ $this, 'check_permission' ],
-        ] );
-
-        register_rest_route( self::NAMESPACE, '/upload-chunk', [
-            'methods'             => 'POST',
-            'callback'            => [ $this, 'upload_chunk' ],
-            'permission_callback' => [ $this, 'check_permission' ],
-        ] );
-
-        register_rest_route( self::NAMESPACE, '/manifest', [
+        register_rest_route( self::NAMESPACE, '/backup-download', [
             'methods'             => 'GET',
-            'callback'            => [ $this, 'get_manifest' ],
+            'callback'            => [ $this, 'backup_download_stream' ],
             'permission_callback' => [ $this, 'check_permission' ],
         ] );
 
-        register_rest_route( self::NAMESPACE, '/prepare-deploy', [
+        register_rest_route( self::NAMESPACE, '/plugin-folder-installer/process', [
             'methods'             => 'POST',
-            'callback'            => [ $this, 'prepare_deploy' ],
-            'permission_callback' => [ $this, 'check_permission' ],
+            'callback'            => [ $this, 'process_plugin_folder_install' ],
+            'permission_callback' => [ $this, 'check_installer_permission' ],
         ] );
 
         /* ---- Section B: File Browser --------------------------------- */
@@ -159,10 +126,22 @@ class WPFD_REST_API {
             'permission_callback' => [ $this, 'check_permission' ],
         ] );
 
+        register_rest_route( self::NAMESPACE, '/download/plugin-token', [
+            'methods'             => 'POST',
+            'callback'            => [ $this, 'download_plugin_token' ],
+            'permission_callback' => [ $this, 'check_permission' ],
+        ] );
+
         register_rest_route( self::NAMESPACE, '/download/serve', [
             'methods'             => 'GET',
             'callback'            => [ $this, 'download_serve' ],
-            'permission_callback' => '__return_true',
+            'permission_callback' => function ( WP_REST_Request $request ) {
+                $token = sanitize_text_field( $request->get_param( 'token' ) ?? '' );
+                if ( empty( $token ) ) {
+                    return false;
+                }
+                return WPFD_Downloader::validate_token( $token );
+            },
         ] );
 
         /* ---- Settings ------------------------------------------------ */
@@ -175,6 +154,12 @@ class WPFD_REST_API {
         register_rest_route( self::NAMESPACE, '/settings', [
             'methods'             => 'POST',
             'callback'            => [ $this, 'save_settings' ],
+            'permission_callback' => [ $this, 'check_permission' ],
+        ] );
+
+        register_rest_route( self::NAMESPACE, '/settings/validate-backup-dir', [
+            'methods'             => 'POST',
+            'callback'            => [ $this, 'validate_backup_dir_setting' ],
             'permission_callback' => [ $this, 'check_permission' ],
         ] );
 
@@ -197,66 +182,118 @@ class WPFD_REST_API {
         if ( ! current_user_can( 'manage_options' ) ) {
             return false;
         }
-        $nonce = $request->get_header( 'X-WPFD-Nonce' ) ?: $request->get_param( '_wpnonce' );
+
+        return $this->verify_request_nonce( $request );
+    }
+
+    public function check_installer_permission( WP_REST_Request $request ): bool {
+        if ( ! current_user_can( 'install_plugins' ) ) {
+            return false;
+        }
+
+        return $this->verify_request_nonce( $request );
+    }
+
+    private function verify_request_nonce( WP_REST_Request $request ): bool {
+        // Backup downloads hit the REST route through a native browser request,
+        // so the WP REST cookie nonce and the WPFD action nonce travel separately.
+        $nonce = $request->get_header( 'X-WPFD-Nonce' );
+        if ( empty( $nonce ) ) {
+            $nonce = $request->get_param( 'wpfd_nonce' );
+        }
+        if ( empty( $nonce ) ) {
+            $nonce = $request->get_param( '_wpnonce' );
+        }
+
         return (bool) wp_verify_nonce( $nonce, WPFD_Security::NONCE_ACTION );
     }
 
-    /** ------------------------------------------------------------------ *
-     *  Upload a single file (called N times — once per file in the folder)
-     * ------------------------------------------------------------------ */
-    public function upload_file( WP_REST_Request $request ): WP_REST_Response {
-        $files        = $request->get_file_params();
-        $relative     = sanitize_text_field( $request->get_param( 'relative_path' ) );
-        $plugin_slug  = sanitize_key( $request->get_param( 'plugin_slug' ) );
-        $is_first     = filter_var( $request->get_param( 'is_first' ), FILTER_VALIDATE_BOOLEAN );
-        $session_id   = sanitize_key( $request->get_param( 'session_id' ) );
+    public function process_plugin_folder_install( WP_REST_Request $request ): WP_REST_Response {
+        $file_params = $request->get_file_params();
+        if ( ! empty( $file_params['package'] ) ) {
+            $result = WPFD_Plugin_Folder_Installer::process_uploaded_package(
+                $file_params,
+                sanitize_text_field( (string) $request->get_param( 'folder_name' ) ),
+                get_current_user_id()
+            );
 
-        if ( empty( $files['file'] ) || $files['file']['error'] !== UPLOAD_ERR_OK ) {
-            return new WP_REST_Response( [ 'success' => false, 'message' => 'Upload error.' ], 400 );
+            $status = empty( $result['results'] ) ? 400 : 200;
+            return new WP_REST_Response( $result, $status );
         }
 
-        if ( empty( $plugin_slug ) || empty( $relative ) ) {
-            return new WP_REST_Response( [ 'success' => false, 'message' => 'Missing parameters.' ], 400 );
+        $raw_relative_paths = $this->get_installer_relative_paths_param( $request );
+        if ( is_wp_error( $raw_relative_paths ) ) {
+            return new WP_REST_Response( [
+                'success' => false,
+                'results' => [],
+                'message' => $raw_relative_paths->get_error_message(),
+            ], 400 );
         }
 
-        // Retrieve/store backup path across the session via transient
-        $transient_key = self::TRANSIENT_PREFIX . $session_id;
-        $backup_path   = get_transient( $transient_key ) ?: '';
-
-        $result = WPFD_Deployer::write_file(
-            $relative,
-            $files['file']['tmp_name'],
-            $is_first,
-            $plugin_slug,
-            $backup_path
+        $relative_paths = array_map(
+            static fn( $path ): string => is_scalar( $path ) ? (string) $path : '',
+            array_values( $raw_relative_paths )
         );
 
-        // Persist backup path for subsequent files in this session
-        if ( $backup_path !== '' ) {
-            set_transient( $transient_key, $backup_path, HOUR_IN_SECONDS );
-        }
+        $result = WPFD_Plugin_Folder_Installer::process_uploaded_payload(
+            $file_params,
+            $relative_paths,
+            get_current_user_id()
+        );
 
-        return new WP_REST_Response( $result, $result['success'] ? 200 : 422 );
+        $status = empty( $result['results'] ) ? 400 : 200;
+        return new WP_REST_Response( $result, $status );
     }
 
-    /** ------------------------------------------------------------------ *
-     *  Finalise — log deployment, optionally activate
-     * ------------------------------------------------------------------ */
-    public function finalise_deploy( WP_REST_Request $request ): WP_REST_Response {
-        $plugin_slug = sanitize_key( $request->get_param( 'plugin_slug' ) );
-        $file_count  = absint( $request->get_param( 'file_count' ) );
-        $activate    = filter_var( $request->get_param( 'activate' ), FILTER_VALIDATE_BOOLEAN );
-        $version     = sanitize_text_field( $request->get_param( 'version' ) ?? '' );
-        $session_id  = sanitize_key( $request->get_param( 'session_id' ) );
-        $deploy_mode = sanitize_key( $request->get_param( 'deploy_mode' ) ?? 'batch' );
-        $skipped     = absint( $request->get_param( 'skipped' ) );
-        $elapsed_ms  = absint( $request->get_param( 'elapsed_ms' ) );
+    private function get_installer_relative_paths_param( WP_REST_Request $request ) {
+        $candidates = [
+            $request->get_param( 'relative_paths' ),
+            $request->get_param( 'relative_paths[]' ),
+            $_POST['relative_paths'] ?? null,
+            $_POST['relative_paths[]'] ?? null,
+        ];
 
-        $backup_path = get_transient( self::TRANSIENT_PREFIX . $session_id ) ?: '';
-        delete_transient( self::TRANSIENT_PREFIX . $session_id );
+        $relative_paths = [];
+        foreach ( $candidates as $candidate ) {
+            $normalized = $this->normalize_installer_relative_paths_param( $candidate );
+            if ( ! empty( $normalized ) ) {
+                $relative_paths = $normalized;
+                break;
+            }
+        }
 
-        $result = WPFD_Deployer::finalise( $plugin_slug, $file_count, $backup_path, $activate, $version, $deploy_mode, $skipped, $elapsed_ms );
-        return new WP_REST_Response( $result, 200 );
+        if ( empty( $relative_paths ) ) {
+            return new WP_Error( 'wpfd_installer_missing_manifest', 'A relative path manifest is required for folder installation.' );
+        }
+
+        return $relative_paths;
+    }
+
+    private function normalize_installer_relative_paths_param( $value ): array {
+        if ( null === $value || '' === $value ) {
+            return [];
+        }
+
+        if ( is_string( $value ) ) {
+            $decoded = json_decode( wp_unslash( $value ), true );
+            if ( is_array( $decoded ) ) {
+                return $this->normalize_installer_relative_paths_param( $decoded );
+            }
+
+            $trimmed = trim( wp_unslash( $value ) );
+            return ( '' === $trimmed ) ? [] : [ $trimmed ];
+        }
+
+        if ( ! is_array( $value ) ) {
+            return [];
+        }
+
+        $normalized = [];
+        foreach ( $value as $item ) {
+            $normalized = array_merge( $normalized, $this->normalize_installer_relative_paths_param( $item ) );
+        }
+
+        return array_values( array_filter( $normalized, static fn( $path ): bool => is_string( $path ) && $path !== '' ) );
     }
 
     /** ------------------------------------------------------------------ *
@@ -287,17 +324,22 @@ class WPFD_REST_API {
     }
 
     public function get_history(): WP_REST_Response {
-        return new WP_REST_Response( WPFD_Deployer::get_history( 50 ), 200 );
+        return new WP_REST_Response( WPFD_Plugin_Folder_Installer::get_install_history( 50 ), 200 );
     }
 
     public function get_plugins(): WP_REST_Response {
-        return new WP_REST_Response( WPFD_Deployer::get_installed_plugins(), 200 );
+        return new WP_REST_Response( WPFD_Plugin_Folder_Installer::get_installed_plugins(), 200 );
     }
 
     public function activate_plugin_route( WP_REST_Request $request ): WP_REST_Response {
         $plugin_file = sanitize_text_field( $request->get_param( 'plugin_file' ) );
         if ( ! function_exists( 'activate_plugin' ) ) {
             require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        }
+        // M-22: Validate plugin_file against installed plugins whitelist
+        $installed = get_plugins();
+        if ( ! isset( $installed[ $plugin_file ] ) ) {
+            return new WP_REST_Response( [ 'success' => false, 'message' => 'Plugin not found.' ], 404 );
         }
         $result = activate_plugin( $plugin_file );
         if ( is_wp_error( $result ) ) {
@@ -311,134 +353,26 @@ class WPFD_REST_API {
         if ( ! function_exists( 'deactivate_plugins' ) ) {
             require_once ABSPATH . 'wp-admin/includes/plugin.php';
         }
+        // M-22: Validate plugin_file against installed plugins whitelist
+        $installed = get_plugins();
+        if ( ! isset( $installed[ $plugin_file ] ) ) {
+            return new WP_REST_Response( [ 'success' => false, 'message' => 'Plugin not found.' ], 404 );
+        }
         deactivate_plugins( $plugin_file );
         return new WP_REST_Response( [ 'success' => true ], 200 );
     }
 
     /** ------------------------------------------------------------------ *
-     *  Batch upload — up to 10 files in a single request
+     *  Backup download — deprecated; use POST /download/plugin-token.
      * ------------------------------------------------------------------ */
-    public function upload_batch( WP_REST_Request $request ): WP_REST_Response {
-        $files        = $request->get_file_params();
-        $plugin_slug  = sanitize_key( $request->get_param( 'plugin_slug' ) );
-        $session_id   = sanitize_key( $request->get_param( 'session_id' ) );
-        $count        = absint( $request->get_param( 'count' ) );
-
-        if ( empty( $plugin_slug ) || $count < 1 || $count > 200 ) {
-            return new WP_REST_Response( [ 'success' => false, 'message' => 'Invalid parameters.' ], 400 );
-        }
-
-        $transient_key = self::TRANSIENT_PREFIX . $session_id;
-        $backup_path   = get_transient( $transient_key ) ?: '';
-
-        /* Defensive fallback: if prepare_deploy was not called, create backup now */
-        if ( $backup_path === '' ) {
-            $backup_path = WPFD_Rollback::backup( $plugin_slug );
-            if ( $backup_path !== '' ) {
-                set_transient( $transient_key, $backup_path, HOUR_IN_SECONDS );
-            }
-        }
-
-        $results = [];
-        for ( $i = 0; $i < $count; $i++ ) {
-            $file_key = 'file_' . $i;
-            $path_key = 'path_' . $i;
-
-            if ( empty( $files[ $file_key ] ) || $files[ $file_key ]['error'] !== UPLOAD_ERR_OK ) {
-                $results[] = [ 'success' => false, 'index' => $i, 'message' => 'Upload error.' ];
-                continue;
-            }
-
-            $relative = sanitize_text_field( $request->get_param( $path_key ) );
-            if ( empty( $relative ) ) {
-                $results[] = [ 'success' => false, 'index' => $i, 'message' => 'Missing path.' ];
-                continue;
-            }
-
-            $result    = WPFD_Deployer::write_file( $relative, $files[ $file_key ]['tmp_name'], false, $plugin_slug, $backup_path );
-            $result['index'] = $i;
-            $results[] = $result;
-        }
-
-        if ( $backup_path !== '' ) {
-            set_transient( $transient_key, $backup_path, HOUR_IN_SECONDS );
-        }
-
-        $written = count( array_filter( $results, fn( $r ) => $r['success'] ) );
-        return new WP_REST_Response( [
-            'success' => true,
-            'results' => $results,
-            'written' => $written,
-            'failed'  => $count - $written,
-        ], 200 );
-    }
-
-    /** ------------------------------------------------------------------ *
-     *  ZIP upload — entire plugin as a single compressed archive
-     * ------------------------------------------------------------------ */
-    public function upload_zip( WP_REST_Request $request ): WP_REST_Response {
-        $files       = $request->get_file_params();
-        $plugin_slug = sanitize_key( $request->get_param( 'plugin_slug' ) );
-        $session_id  = sanitize_key( $request->get_param( 'session_id' ) );
-
-        if ( empty( $files['zip'] ) || $files['zip']['error'] !== UPLOAD_ERR_OK ) {
-            return new WP_REST_Response( [ 'success' => false, 'message' => 'ZIP upload error.' ], 400 );
-        }
-
-        if ( empty( $plugin_slug ) ) {
-            return new WP_REST_Response( [ 'success' => false, 'message' => 'Missing plugin slug.' ], 400 );
-        }
-
-        $transient_key = self::TRANSIENT_PREFIX . $session_id;
-        $backup_path   = get_transient( $transient_key ) ?: '';
-
-        $result = WPFD_Deployer::extract_zip( $files['zip']['tmp_name'], $plugin_slug, $backup_path );
-
-        if ( $backup_path !== '' ) {
-            set_transient( $transient_key, $backup_path, HOUR_IN_SECONDS );
-        }
-
-        return new WP_REST_Response( $result, $result['success'] ? 200 : 422 );
-    }
-
-    /** ------------------------------------------------------------------ *
-     *  Chunk upload — large files split into 1 MB pieces
-     * ------------------------------------------------------------------ */
-    public function upload_chunk( WP_REST_Request $request ): WP_REST_Response {
-        $files       = $request->get_file_params();
-        $session_id  = sanitize_key( $request->get_param( 'session_id' ) );
-        $file_hash   = sanitize_key( $request->get_param( 'file_hash' ) );
-        $chunk_index = absint( $request->get_param( 'chunk_index' ) );
-        $chunk_total = absint( $request->get_param( 'chunk_total' ) );
-        $relative    = sanitize_text_field( $request->get_param( 'relative_path' ) );
-        $plugin_slug = sanitize_key( $request->get_param( 'plugin_slug' ) );
-
-        if ( empty( $files['chunk'] ) || $files['chunk']['error'] !== UPLOAD_ERR_OK ) {
-            return new WP_REST_Response( [ 'success' => false, 'message' => 'Chunk upload error.' ], 400 );
-        }
-
-        if ( empty( $file_hash ) || $chunk_total < 1 ) {
-            return new WP_REST_Response( [ 'success' => false, 'message' => 'Invalid chunk parameters.' ], 400 );
-        }
-
-        $result = WPFD_Deployer::write_chunk(
-            $files['chunk']['tmp_name'], $session_id, $file_hash,
-            $chunk_index, $chunk_total, $relative, $plugin_slug
+    public function backup_download_stream( WP_REST_Request $request ): WP_REST_Response {
+        return new WP_REST_Response(
+            [
+                'success' => false,
+                'message' => 'Direct backup downloads are deprecated. Use the token-based download flow instead.',
+            ],
+            410
         );
-
-        return new WP_REST_Response( $result, $result['success'] ? 200 : 422 );
-    }
-
-    /** ------------------------------------------------------------------ *
-     *  Manifest — file hashes for delta deploy
-     * ------------------------------------------------------------------ */
-    public function get_manifest( WP_REST_Request $request ): WP_REST_Response {
-        $plugin_slug = sanitize_key( $request->get_param( 'slug' ) );
-        if ( empty( $plugin_slug ) ) {
-            return new WP_REST_Response( [ 'success' => false, 'message' => 'Missing slug.' ], 400 );
-        }
-        $manifest = WPFD_Deployer::build_manifest( $plugin_slug );
-        return new WP_REST_Response( [ 'success' => true, 'manifest' => $manifest ], 200 );
     }
 
     /** ------------------------------------------------------------------ *
@@ -450,7 +384,10 @@ class WPFD_REST_API {
         foreach ( WPFD_Browser::get_aliases() as $alias ) {
             $path = WPFD_Browser::resolve_root( $alias );
             if ( $path !== false ) {
-                $roots[ $alias ] = true;
+                // Obfuscate absolute path: show only the last 2 directory components.
+                $parts = array_filter( explode( DIRECTORY_SEPARATOR, $path ) );
+                $display = '…/' . implode( '/', array_slice( $parts, -2 ) );
+                $roots[ $alias ] = $display;
             }
         }
         return new WP_REST_Response( [ 'success' => true, 'roots' => $roots ], 200 );
@@ -578,6 +515,11 @@ class WPFD_REST_API {
             return new WP_REST_Response( [ 'success' => false, 'message' => 'Not a readable file.' ], 400 );
         }
 
+        // Block sensitive file extensions from being read via browser.
+        if ( WPFD_Security::is_browser_blocked_file( $abs_path ) ) {
+            return new WP_REST_Response( [ 'success' => false, 'message' => 'This file type cannot be read via browser.' ], 403 );
+        }
+
         $max_size = 2 * 1024 * 1024; // 2 MB
         $size     = filesize( $abs_path );
         if ( $size > $max_size ) {
@@ -587,6 +529,13 @@ class WPFD_REST_API {
         $content = file_get_contents( $abs_path );
         if ( $content === false ) {
             return new WP_REST_Response( [ 'success' => false, 'message' => 'Read failed.' ], 500 );
+        }
+
+        if ( ! mb_check_encoding( $content, 'UTF-8' ) ) {
+            return new WP_REST_Response( [
+                'success' => false,
+                'message' => 'File appears to be binary and cannot be displayed as text.',
+            ], 415 );
         }
 
         return new WP_REST_Response( [
@@ -637,7 +586,7 @@ class WPFD_REST_API {
             'json', 'xml', 'yaml', 'yml', 'toml', 'sql', 'sh', 'bash', 'zsh',
             'ps1', 'py', 'rb', 'java', 'c', 'h', 'cpp', 'cs', 'go', 'rs',
             'swift', 'kt', 'lua', 'r', 'pl', 'md', 'txt', 'csv', 'log',
-            'env', 'htaccess', 'conf', 'svg', 'map', 'lock', 'pot', 'po',
+            'svg', 'map', 'lock', 'pot', 'po',
         ];
 
         $max_files  = 200;
@@ -645,6 +594,7 @@ class WPFD_REST_API {
         $max_single = 512 * 1024;       // 512 KB per file
         $files      = [];
         $total_size = 0;
+        $truncated  = false;
 
         $iterator = new RecursiveIteratorIterator(
             new RecursiveDirectoryIterator( $abs_path, RecursiveDirectoryIterator::SKIP_DOTS ),
@@ -653,6 +603,7 @@ class WPFD_REST_API {
 
         foreach ( $iterator as $file ) {
             if ( count( $files ) >= $max_files ) {
+                $truncated = true;
                 break;
             }
             if ( ! $file->isFile() || ! $file->isReadable() ) {
@@ -664,15 +615,20 @@ class WPFD_REST_API {
                 continue;
             }
 
+            $real_file = $file->getRealPath();
+            if ( WPFD_Security::is_browser_blocked_file( $real_file ) ) {
+                continue;
+            }
+
             $fsize = $file->getSize();
             if ( $fsize > $max_single ) {
                 continue; // skip oversized individual files silently
             }
             if ( $total_size + $fsize > $max_total ) {
+                $truncated = true;
                 break;
             }
 
-            $real_file = $file->getRealPath();
             // Safety: must stay within the target directory
             if ( strpos( $real_file . $sep, $abs_path . $sep ) !== 0 ) {
                 continue;
@@ -702,7 +658,7 @@ class WPFD_REST_API {
             'dirname'   => basename( $abs_path ),
             'files'     => $files,
             'count'     => count( $files ),
-            'truncated' => count( $files ) >= $max_files || $total_size >= $max_total,
+            'truncated' => $truncated,
         ], 200 );
     }
 
@@ -745,32 +701,6 @@ class WPFD_REST_API {
             'total_bytes' => $scan['total_bytes'] ?? 0,
             'readonly'    => count( $scan['readonly'] ?? [] ),
             'error'       => $scan['error'] ?? '',
-        ], 200 );
-    }
-
-    /** ------------------------------------------------------------------ *
-     *  Prepare deploy — create backup upfront and return session info.
-     *  Eliminates the backup race condition from concurrent batch uploads.
-     * ------------------------------------------------------------------ */
-    public function prepare_deploy( WP_REST_Request $request ): WP_REST_Response {
-        $plugin_slug = sanitize_key( $request->get_param( 'plugin_slug' ) );
-        $session_id  = sanitize_key( $request->get_param( 'session_id' ) );
-
-        if ( empty( $plugin_slug ) || empty( $session_id ) ) {
-            return new WP_REST_Response( [ 'success' => false, 'message' => 'Missing parameters.' ], 400 );
-        }
-
-        $backup_path = WPFD_Rollback::backup( $plugin_slug );
-
-        $transient_key = self::TRANSIENT_PREFIX . $session_id;
-        if ( ! empty( $backup_path ) ) {
-            set_transient( $transient_key, $backup_path, HOUR_IN_SECONDS );
-        }
-
-        return new WP_REST_Response( [
-            'success'     => true,
-            'backup_path' => $backup_path,
-            'session_id'  => $session_id,
         ], 200 );
     }
 
@@ -819,6 +749,10 @@ class WPFD_REST_API {
             return new WP_REST_Response( [ 'success' => false, 'message' => 'Items required.' ], 400 );
         }
 
+        if ( count( $items ) > 500 ) {
+            return new WP_REST_Response( [ 'success' => false, 'message' => 'Too many items.' ], 400 );
+        }
+
         $abs_paths = [];
         foreach ( $items as $item ) {
             $alias   = sanitize_key( $item['root'] ?? '' );
@@ -857,14 +791,68 @@ class WPFD_REST_API {
         ], 200 );
     }
 
-    /** Serve a download — validates and consumes the token. */
+    /** Generate a download token for an installed plugin or rollback snapshot. */
+    public function download_plugin_token( WP_REST_Request $request ): WP_REST_Response {
+        // No ZipArchive gate: directory downloads use the built-in streaming ZIP
+        // writer (WPFD_Zip_Stream), which is pure PHP and needs no extension.
+        $slug        = sanitize_key( $request->get_param( 'slug' ) ?? '' );
+        $backup_path = sanitize_text_field( $request->get_param( 'backup_path' ) ?? '' );
+
+        if ( $slug === '' ) {
+            return new WP_REST_Response( [ 'success' => false, 'message' => 'Plugin slug required.' ], 400 );
+        }
+
+        $timestamp = gmdate( 'Y-m-d_H-i-s' );
+
+        if ( $backup_path !== '' ) {
+            if ( ! WPFD_Rollback::is_backup_snapshot_path( $backup_path ) || ! is_dir( $backup_path ) ) {
+                return new WP_REST_Response( [ 'success' => false, 'message' => 'Backup snapshot not found.' ], 404 );
+            }
+
+            $abs_path      = (string) realpath( $backup_path );
+            $download_name = $slug . '--snapshot--' . $timestamp;
+        } else {
+            $plugin_dir = rtrim( WPFD_DEPLOY_DIR, '/\\' ) . DIRECTORY_SEPARATOR . $slug;
+            if ( ! is_dir( $plugin_dir ) ) {
+                return new WP_REST_Response( [ 'success' => false, 'message' => 'Plugin directory not found.' ], 404 );
+            }
+
+            $abs_path      = (string) realpath( $plugin_dir );
+            $download_name = $slug . '--installed--' . $timestamp;
+        }
+
+        $token = WPFD_Downloader::create_token(
+            $abs_path,
+            [
+                'download_name' => $download_name,
+                'zip_root_name' => $slug,
+            ]
+        );
+
+        return new WP_REST_Response( [
+            'success' => true,
+            'token'   => $token,
+            'url'     => rest_url( self::NAMESPACE . '/download/serve' ) . '?token=' . $token,
+        ], 200 );
+    }
+
+    /** Serve a download — validates the token and streams the file. */
     public function download_serve( WP_REST_Request $request ): WP_REST_Response {
         $token = sanitize_text_field( $request->get_param( 'token' ) ?? '' );
         if ( empty( $token ) ) {
             return new WP_REST_Response( [ 'success' => false, 'message' => 'Token required.' ], 400 );
         }
 
-        $data = WPFD_Downloader::consume_token( $token );
+        // A Range request is one segment of a resumable / parallel download, so it
+        // must NOT burn the single-use token — peek instead, leaving the token
+        // valid for the other segments. Its 5-minute TTL bounds the lifetime, and
+        // IP binding stops replay. A plain (non-Range) GET consumes the token as
+        // before, preserving single-use semantics for ordinary one-shot downloads.
+        $is_range = ! empty( $_SERVER['HTTP_RANGE'] );
+        $data     = $is_range
+            ? WPFD_Downloader::peek_token( $token )
+            : WPFD_Downloader::consume_token( $token );
+
         if ( ! $data ) {
             return new WP_REST_Response( [ 'success' => false, 'message' => 'Invalid or expired token.' ], 403 );
         }
@@ -882,7 +870,11 @@ class WPFD_REST_API {
         }
 
         if ( is_dir( $abs_path ) ) {
-            WPFD_Downloader::stream_dir_zip( $abs_path );
+            WPFD_Downloader::stream_dir_zip(
+                $abs_path,
+                (string) ( $data['download_name'] ?? '' ),
+                (string) ( $data['zip_root_name'] ?? '' )
+            );
         } else {
             WPFD_Downloader::stream_file( $abs_path );
         }
@@ -898,10 +890,40 @@ class WPFD_REST_API {
     /** Return current plugin settings. */
     public function get_settings(): WP_REST_Response {
         $defaults = [
+            'backup_dir'       => WPFD_Rollback::get_default_backup_dir(),
             'backup_retention' => 5,
         ];
         $settings = wp_parse_args( get_option( 'wpfd_settings', [] ), $defaults );
-        return new WP_REST_Response( [ 'success' => true, 'settings' => $settings ], 200 );
+
+        if ( ! empty( $settings['backup_dir'] ) ) {
+            $settings['backup_dir'] = trailingslashit( wp_normalize_path( untrailingslashit( (string) $settings['backup_dir'] ) ) );
+        }
+
+        $abspath_prefix = trailingslashit( wp_normalize_path( ABSPATH ) );
+        $display_dir    = str_starts_with( $settings['backup_dir'], $abspath_prefix )
+            ? ltrim( substr( $settings['backup_dir'], strlen( $abspath_prefix ) ), '/' )
+            : $settings['backup_dir'];
+
+        $last_test = get_option( 'wpfd_backup_dir_last_test', [] );
+        $parts     = array_filter( explode( '/', wp_normalize_path( (string) $settings['backup_dir'] ) ) );
+
+        return new WP_REST_Response(
+            [
+                'success'  => true,
+                'settings' => $settings,
+                'display'  => [
+                    'backup_dir'         => $display_dir,
+                    'resolved_backup_dir'=> $settings['backup_dir'],
+                    'resolved_display'   => '…/' . implode( '/', array_slice( $parts, -2 ) ),
+                ],
+                'health'   => [
+                    'ziparchive'          => class_exists( 'ZipArchive' ),
+                    'backup_dir_writable' => ! empty( $last_test['success'] ),
+                    'last_test'           => is_array( $last_test ) ? $last_test : [],
+                ],
+            ],
+            200
+        );
     }
 
     /** Save plugin settings. */
@@ -913,13 +935,65 @@ class WPFD_REST_API {
             $settings = [];
         }
 
+        $previous_backup_dir = isset( $settings['backup_dir'] ) ? (string) $settings['backup_dir'] : '';
+
         if ( isset( $input['backup_retention'] ) ) {
             $val = absint( $input['backup_retention'] );
             $settings['backup_retention'] = max( 1, min( 50, $val ) );
         }
 
+        if ( isset( $input['backup_dir'] ) ) {
+            $resolved = trailingslashit(
+                wp_normalize_path(
+                    untrailingslashit(
+                        WPFD_Security::resolve_backup_dir_input( (string) $input['backup_dir'] )
+                    )
+                )
+            );
+
+            $validation = WPFD_Security::validate_backup_path( $resolved );
+            if ( $validation !== true ) {
+                return new WP_REST_Response(
+                    [
+                        'success' => false,
+                        'message' => is_string( $validation ) ? $validation : 'Invalid backup directory.',
+                    ],
+                    422
+                );
+            }
+
+            $test = WPFD_Rollback::test_backup_dir( $resolved );
+            if ( empty( $test['success'] ) ) {
+                return new WP_REST_Response(
+                    [
+                        'success' => false,
+                        'message' => $test['message'] ?? 'Backup directory validation failed.',
+                    ],
+                    422
+                );
+            }
+
+            $settings['backup_dir'] = $resolved;
+        }
+
         update_option( 'wpfd_settings', $settings );
-        return new WP_REST_Response( [ 'success' => true, 'settings' => $settings ], 200 );
+
+        if ( $previous_backup_dir !== '' && $previous_backup_dir !== ( $settings['backup_dir'] ?? '' ) ) {
+            delete_transient( 'wpfd_bl_all' );
+        }
+
+        return $this->get_settings();
+    }
+
+    /** Validate a backup directory without saving settings. */
+    public function validate_backup_dir_setting( WP_REST_Request $request ): WP_REST_Response {
+        $input = $request->get_json_params();
+        $path  = is_array( $input ) ? (string) ( $input['backup_dir'] ?? '' ) : '';
+
+        $result = WPFD_Rollback::test_backup_dir( $path );
+        $status = ! empty( $result['success'] ) ? 200 : 422;
+
+        return new WP_REST_Response( $result, $status );
     }
 
     /* ==================================================================
@@ -931,6 +1005,10 @@ class WPFD_REST_API {
         $items = $request->get_param( 'items' );
         if ( ! is_array( $items ) || empty( $items ) ) {
             return new WP_REST_Response( [ 'success' => false, 'message' => 'Items required.' ], 400 );
+        }
+
+        if ( count( $items ) > 500 ) {
+            return new WP_REST_Response( [ 'success' => false, 'message' => 'Too many items (max 500).' ], 400 );
         }
 
         $results = [];
@@ -989,21 +1067,13 @@ class WPFD_REST_API {
             return new WP_REST_Response( [ 'success' => false, 'message' => 'IDs required.' ], 400 );
         }
 
-        global $wpdb;
-        $table       = $wpdb->prefix . 'wpfd_deployments';
-        $int_ids     = array_values( array_filter( array_map( 'absint', $ids ) ) );
+        $int_ids = array_values( array_filter( array_map( 'absint', $ids ) ) );
 
         if ( empty( $int_ids ) ) {
             return new WP_REST_Response( [ 'success' => false, 'message' => 'No valid IDs.' ], 400 );
         }
 
-        $placeholders = implode( ',', array_fill( 0, count( $int_ids ), '%d' ) );
-
-        // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-        $deleted = $wpdb->query( $wpdb->prepare(
-            "DELETE FROM {$table} WHERE id IN ({$placeholders})",
-            $int_ids
-        ) );
+        $deleted = WPFD_Plugin_Folder_Installer::delete_install_history( $int_ids );
 
         return new WP_REST_Response( [ 'success' => true, 'deleted' => $deleted ], 200 );
     }

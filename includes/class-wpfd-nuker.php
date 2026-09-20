@@ -6,9 +6,9 @@
  * that may be locked, read-only, or otherwise resistant to deletion.
  *
  * Security boundary: refuses any path outside ABSPATH, refuses the uploads
- * root, wp-config.php, and the deployer plugin's own directory.
+ * root, wp-config.php, and the plugin installer directory itself.
  *
- * @package    WP_Folder_Deployer
+ * @package    WPFD
  * @since      5.0.0
  */
 
@@ -49,7 +49,7 @@ class WPFD_Nuker {
            realpath() returns the OS-native separator and resolves symlinks. */
         $user_id = get_current_user_id();
         // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
-        error_log( sprintf( '[WPFD Nuke] user=%d path=%s', $user_id, $abs_path ) );
+        error_log( sprintf( '[WPFD Nuke] user=%d path=%s', $user_id, wp_basename( $abs_path ) ) );
 
         $real = realpath( $abs_path );
         if ( $real !== false ) {
@@ -118,9 +118,9 @@ class WPFD_Nuker {
         }
         $log[] = 'Strategy 3 failed.';
 
-        /* -- Strategy 4: exec() shell command -- */
+        /* -- Strategy 4: exec() shell command (opt-in via WPFD_ALLOW_EXEC_DELETE constant) -- */
         $log[] = 'Strategy 4: shell exec';
-        if ( function_exists( 'exec' ) ) {
+        if ( defined( 'WPFD_ALLOW_EXEC_DELETE' ) && WPFD_ALLOW_EXEC_DELETE && function_exists( 'exec' ) ) {
             /* Use native-separator path for shell commands. */
             $native = realpath( $abs_path );
             if ( ! $native ) {
@@ -129,13 +129,19 @@ class WPFD_Nuker {
             }
             $content_real = realpath( WP_CONTENT_DIR );
             $abspath_real = realpath( ABSPATH );
-            $inside_safe  = ( $content_real && strncmp( $native, $content_real, strlen( $content_real ) ) === 0 )
-                         || ( $abspath_real && strncmp( $native, $abspath_real, strlen( $abspath_real ) ) === 0 );
+            // Append separator so /var/www/html_other does not match /var/www/html
+            $content_check = $content_real ? rtrim( $content_real, DIRECTORY_SEPARATOR ) . DIRECTORY_SEPARATOR : '';
+            $abspath_check = $abspath_real ? rtrim( $abspath_real, DIRECTORY_SEPARATOR ) . DIRECTORY_SEPARATOR : '';
+            $native_check  = rtrim( $native, DIRECTORY_SEPARATOR ) . DIRECTORY_SEPARATOR;
+            $inside_safe  = ( $content_check && strncmp( $native_check, $content_check, strlen( $content_check ) ) === 0 )
+                         || ( $abspath_check && strncmp( $native_check, $abspath_check, strlen( $abspath_check ) ) === 0 );
 
             if ( $native && $inside_safe ) {
                 $escaped = escapeshellarg( $native );
                 $out     = [];
                 $ret     = 1;
+                // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+                error_log( sprintf( '[WPFD Nuke] Strategy 4 shell exec firing: user=%d path=%s os=%s', get_current_user_id(), wp_basename( $native ), PHP_OS_FAMILY ) );
                 if ( PHP_OS_FAMILY === 'Windows' ) {
                     if ( is_dir( $native ) && $recursive ) {
                         exec( 'rd /s /q ' . $escaped . ' 2>&1', $out, $ret );
@@ -157,7 +163,7 @@ class WPFD_Nuker {
                 $log[] = 'Strategy 4 skipped: path outside allowed boundary or unresolvable.';
             }
         } else {
-            $log[] = 'Strategy 4 skipped: exec() disabled.';
+            $log[] = 'Strategy 4 skipped: exec() not enabled (define WPFD_ALLOW_EXEC_DELETE in wp-config.php).';
         }
         $log[] = 'Strategy 4 failed.';
 
@@ -190,7 +196,7 @@ class WPFD_Nuker {
         $log[] = 'Strategy 5 failed.';
 
         // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
-        error_log( sprintf( '[WPFD Nuke] FAILED user=%d path=%s — all 5 strategies exhausted', get_current_user_id(), $abs_path ) );
+        error_log( sprintf( '[WPFD Nuke] FAILED user=%d path=%s — all 5 strategies exhausted', get_current_user_id(), wp_basename( $abs_path ) ) );
 
         return [
             'success'       => false,
@@ -302,18 +308,22 @@ class WPFD_Nuker {
         }
 
         /* Must not be this plugin directory */
-        $plugin_dir = wp_normalize_path( WPFD_PLUGIN_DIR );
-        if ( strncmp( $abs_path, $plugin_dir, strlen( $plugin_dir ) ) === 0 ) {
-            return 'Refused: cannot delete the Folder Deployer plugin directory.';
+        $plugin_dir = rtrim( wp_normalize_path( WPFD_PLUGIN_DIR ), '/' ) . '/';
+        $plugin_git = $plugin_dir . '.git/';
+        if (
+            strncmp( $path_check, $plugin_dir, strlen( $plugin_dir ) ) === 0
+            && strncmp( $path_check, $plugin_git, strlen( $plugin_git ) ) !== 0
+        ) {
+            return 'Refused: cannot delete the Plugin Folder Installer directory.';
         }
 
         /* Must not be inside wp-admin or wp-includes (core directories) */
-        $wp_admin_norm    = wp_normalize_path( ABSPATH . 'wp-admin' );
-        $wp_includes_norm = wp_normalize_path( ABSPATH . 'wp-includes' );
-        if ( strncmp( $abs_path, $wp_admin_norm, strlen( $wp_admin_norm ) ) === 0 ) {
+        $wp_admin_norm    = rtrim( wp_normalize_path( ABSPATH . 'wp-admin' ), '/' ) . '/';
+        $wp_includes_norm = rtrim( wp_normalize_path( ABSPATH . 'wp-includes' ), '/' ) . '/';
+        if ( strncmp( $path_check, $wp_admin_norm, strlen( $wp_admin_norm ) ) === 0 ) {
             return 'Refused: cannot delete inside wp-admin/.';
         }
-        if ( strncmp( $abs_path, $wp_includes_norm, strlen( $wp_includes_norm ) ) === 0 ) {
+        if ( strncmp( $path_check, $wp_includes_norm, strlen( $wp_includes_norm ) ) === 0 ) {
             return 'Refused: cannot delete inside wp-includes/.';
         }
 
@@ -347,37 +357,37 @@ class WPFD_Nuker {
             foreach ( $it as $item ) {
                 $real_item = $item->getRealPath();
                 if ( $item->isDir() ) {
-                    @chmod( $real_item, 0777 );
+                    @chmod( $real_item, 0755 );
                     @rmdir( $real_item );
                 } else {
-                    @chmod( $real_item, 0666 );
+                    @chmod( $real_item, 0644 );
                     @unlink( $real_item );
                 }
             }
         } catch ( \Exception $e ) {
             // best-effort - continue to try rmdir on parent
         }
-        @chmod( $dir, 0777 );
+        @chmod( $dir, 0755 );
         return @rmdir( $dir );
     }
 
-    /** Recursively chmod all files/dirs to a permissive mode. */
+    /** Recursively chmod all files/dirs to allow deletion. */
     private static function chmod_recursive( string $path ): void {
         if ( is_dir( $path ) ) {
-            @chmod( $path, 0777 );
+            @chmod( $path, 0755 );
             try {
                 $it = new \RecursiveIteratorIterator(
                     new \RecursiveDirectoryIterator( $path, \RecursiveDirectoryIterator::SKIP_DOTS ),
                     \RecursiveIteratorIterator::CHILD_FIRST
                 );
                 foreach ( $it as $item ) {
-                    @chmod( $item->getRealPath(), $item->isDir() ? 0777 : 0666 );
+                    @chmod( $item->getRealPath(), $item->isDir() ? 0755 : 0644 );
                 }
             } catch ( \Exception $e ) {
                 // best-effort
             }
         } else {
-            @chmod( $path, 0666 );
+            @chmod( $path, 0644 );
         }
     }
 

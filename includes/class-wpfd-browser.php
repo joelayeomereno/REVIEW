@@ -45,6 +45,9 @@ class WPFD_Browser {
                 $path = WP_CONTENT_DIR;
                 break;
             case 'root':
+                if ( ! defined( 'WPFD_ALLOW_ROOT_BROWSE' ) || ! WPFD_ALLOW_ROOT_BROWSE ) {
+                    return false;
+                }
                 $path = ABSPATH;
                 break;
             default:
@@ -79,27 +82,28 @@ class WPFD_Browser {
             return [];
         }
 
-        $items = @scandir( $abs_path );
-        if ( $items === false ) {
-            return [];
-        }
-
         $entries = [];
-        foreach ( $items as $name ) {
-            if ( $name === '.' || $name === '..' ) {
-                continue;
+        try {
+            // DirectoryIterator batches the underlying stat() call into SplFileInfo,
+            // eliminating 4 redundant syscalls per entry that scandir() + individual
+            // is_dir/filesize/fileperms/filemtime/is_readable/is_writable produces.
+            foreach ( new DirectoryIterator( $abs_path ) as $item ) {
+                if ( $item->isDot() ) {
+                    continue;
+                }
+                $is_dir    = $item->isDir();
+                $entries[] = [
+                    'name'     => $item->getFilename(),
+                    'type'     => $is_dir ? 'dir' : 'file',
+                    'size'     => $is_dir ? 0 : (int) $item->getSize(),
+                    'perms'    => substr( sprintf( '%o', $item->getPerms() ), -4 ),
+                    'modified' => $item->getMTime(),
+                    'readable' => $item->isReadable(),
+                    'writable' => $item->isWritable(),
+                ];
             }
-            $full   = $abs_path . DIRECTORY_SEPARATOR . $name;
-            $is_dir = is_dir( $full );
-            $entries[] = [
-                'name'     => $name,
-                'type'     => $is_dir ? 'dir' : 'file',
-                'size'     => $is_dir ? 0 : (int) @filesize( $full ),
-                'perms'    => substr( sprintf( '%o', (int) @fileperms( $full ) ), -4 ),
-                'modified' => (int) @filemtime( $full ),
-                'readable' => is_readable( $full ),
-                'writable' => is_writable( $full ),
-            ];
+        } catch ( \Exception $e ) {
+            return [];
         }
 
         // Directories first; within each group, alphabetical case-insensitive.
@@ -122,13 +126,20 @@ class WPFD_Browser {
         // Split on both forward and back slashes.
         $parts = preg_split( '#[/\\\\]+#', $raw );
         $clean = [];
+        $stripped = false;
         foreach ( $parts as $part ) {
             $part = trim( $part );
             // Drop empty, dot, double-dot, and any component with null bytes.
             if ( $part === '' || $part === '.' || $part === '..' || strpos( $part, "\0" ) !== false ) {
+                if ( $part === '..' ) {
+                    $stripped = true;
+                }
                 continue;
             }
             $clean[] = $part;
+        }
+        if ( $stripped ) {
+            error_log( sprintf( '[WPFD] Path traversal attempt stripped from: %s', substr( $raw, 0, 200 ) ) );
         }
         return implode( '/', $clean );
     }
